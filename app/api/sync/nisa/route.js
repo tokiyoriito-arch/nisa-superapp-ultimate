@@ -138,16 +138,17 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-    // UPSERT（300件ずつ）
-    let inserted = 0;
-    for (let i = 0; i < combined.length; i += 300) {
-      const { data, error } = await supabase
-        .from("funds")
-        .upsert(combined.slice(i, i + 300), { onConflict: "isin,name" })
-        .select();
-      if (error) throw error;
-      inserted += data?.length || 0;
-    }
+// DBへUPSERT（300件ずつ）← insert + upsert:true に変更
+let inserted = 0;
+for (let i = 0; i < combined.length; i += 300) {
+  const chunk = combined.slice(i, i + 300);
+  const { data, error } = await supabase
+    .from("funds")
+    .insert(chunk, { upsert: true, onConflict: "isin,name" })
+    .select();
+  if (error) throw error;
+  inserted += data?.length || 0;
+}
 
     return NextResponse.json({ ok: true, inserted, total: combined.length, debug: dbg });
   } catch (err) {
