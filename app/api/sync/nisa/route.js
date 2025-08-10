@@ -138,7 +138,7 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-// DBへUPSERT（300件ずつ）← Supabase RESTで実行
+// DBへUPSERT（300件ずつ）— ISINが空の行はスキップしてREST UPSERT
 const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE;
 
@@ -159,16 +159,33 @@ async function restUpsertFunds(rows) {
     const body = await res.text().catch(() => '');
     throw new Error(`REST upsert failed: ${res.status} ${body}`);
   }
-  return res.json(); // 返り値は挿入・更新された行の配列
+  return res.json();
 }
 
 let inserted = 0;
+let skippedNoIsin = 0;
+
 for (let i = 0; i < combined.length; i += 300) {
   const chunk = combined.slice(i, i + 300);
-  const data = await restUpsertFunds(chunk);
+  // ★ ISINが空/NULLのレコードを除外
+  const valid = chunk.filter(r => r.isin && String(r.isin).trim().length > 0);
+  skippedNoIsin += (chunk.length - valid.length);
+  if (valid.length === 0) continue;
+
+  const data = await restUpsertFunds(valid);
   inserted += Array.isArray(data) ? data.length : 0;
 }
 
+// （必要ならレスポンスに含める）
+return NextResponse.json({
+  ok: true,
+  inserted,
+  total: combined.length,
+  skippedNoIsin,
+  debug: dbg
+});
+
+// ここまで -DBへUPSERT（300件ずつ）
 
     return NextResponse.json({ ok: true, inserted, total: combined.length, debug: dbg });
   } catch (err) {
