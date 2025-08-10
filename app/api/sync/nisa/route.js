@@ -4,34 +4,37 @@ import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import * as XLSX from "xlsx";
 
-// 1) 金融庁ページから「最新ExcelのURL」を動的に抽出
+// --- 最新ExcelのURLを自動抽出（金融庁 つみたて） ---
 async function getLatestFsaExcel() {
-  // 環境変数で固定URLを指定できる逃げ道
+  // 手動で固定したい場合は Vercel 環境変数で上書き可
   if (process.env.FSA_TSUMITATE_EXCEL_URL) return process.env.FSA_TSUMITATE_EXCEL_URL;
 
   const res = await fetch("https://www.fsa.go.jp/policy/nisa2/products/", {
-    headers: {
-      // 一部サイトはUAが無いと拒否することがあるため
-      "user-agent": "Mozilla/5.0 NISA SuperApp (Node fetch)"
-    },
+    headers: { "user-agent": "Mozilla/5.0 NISA SuperApp" },
     cache: "no-store"
   });
+  if (!res.ok) throw new Error("FSA products page fetch failed");
   const html = await res.text();
 
-  // ページ中の「…/products/日付/番号.xlsx」を全部拾って、一番最初のものを使う
+  // 例: https://www.fsa.go.jp/policy/nisa2/products/20250728/23.xlsx
   const re = /https:\/\/www\.fsa\.go\.jp\/policy\/nisa2\/products\/\d{8}\/\d+\.xlsx/g;
   const matches = html.match(re) || [];
-  if (matches.length === 0) throw new Error("FSA Excel URL not found");
-  return matches[0]; // 先頭を採用（＝最新の「運用会社別」Excelが先に出る想定）
+
+  // 旧URLの保険（たまに置いてあることがある）
+  const legacy = html.match(/https:\/\/www\.fsa\.go\.jp\/policy\/nisa2\/products\/tsumitate_list\.xlsx/g) || [];
+
+  const pick = matches[0] || legacy[0];
+  if (!pick) throw new Error("FSA Excel URL not found on page");
+  return pick;
 }
 
-// 2) 投信協会（成長投資枠）ExcelのURL（固定）
+// --- 投信協会（成長投資枠）は固定URL（必要なら環境変数で差し替え） ---
 function getToushinExcel() {
   return process.env.TOUSHIN_GROWTH_EXCEL_URL
     || "https://www.toushin.or.jp/files/static/486/unlisted_fund_for_investor.xlsx";
 }
 
-// 共通：Excel→オブジェクト配列
+// --- Excel → 行配列 ---
 async function fetchExcelToJson(url) {
   const res = await fetch(url, { cache: "no-store" });
   if (!res.ok) throw new Error(`Excel fetch failed: ${url}`);
@@ -41,15 +44,15 @@ async function fetchExcelToJson(url) {
   return XLSX.utils.sheet_to_json(ws, { defval: "" });
 }
 
-// 列名のゆらぎに耐えるマッパー（ISIN/名称/会社/分類）
+// --- 列名ゆらぎに強いマッパー ---
 function mapRow(row, flags = {}) {
-  const pick = (cands) =>
+  const find = (cands) =>
     cands.map(k => Object.keys(row).find(h => h && String(h).includes(k))).find(Boolean);
 
-  const isin = String(row[pick(["ISIN", "ISINコード", "銘柄コード"])] || "").trim();
-  const name = String(row[pick(["ファンド名", "ファンド名称", "商品名"])] || "").trim();
-  const company = String(row[pick(["運用会社", "運用会社名"])] || "").trim();
-  const category = String(row[pick(["資産分類", "資産区分", "分類"])] || "").trim();
+  const isin = String(row[find(["ISIN", "ISINコード", "銘柄コード"])] || "").trim();
+  const name = String(row[find(["ファンド名", "ファンド名称", "商品名"])] || "").trim();
+  const company = String(row[find(["運用会社", "運用会社名"])] || "").trim();
+  const category = String(row[find(["資産分類", "資産区分", "分類"])] || "").trim();
 
   if (!name) return null;
   return {
@@ -62,40 +65,44 @@ function mapRow(row, flags = {}) {
   };
 }
 
-export async function GET() {
+export async function GET(req) {
+  const url = new URL(req.url);
+  const debug = url.searchParams.get("debug") === "1";
+  const dbg = { fsaUrl: null, toushinUrl: null, fsaCount: 0, toushinCount: 0, errors: [] };
+
   try {
     const supabase = supabaseServer();
+    let combined = [];
 
     // FSA（つみたて）
-    let combined = [];
     try {
       const fsaUrl = await getLatestFsaExcel();
+      dbg.fsaUrl = fsaUrl;
       const list = await fetchExcelToJson(fsaUrl);
-      list.forEach(r => {
-        const m = mapRow(r, { tsumitate: true });
-        if (m) combined.push(m);
-      });
+      const mapped = list.map(r => mapRow(r, { tsumitate: true })).filter(Boolean);
+      dbg.fsaCount = mapped.length;
+      combined.push(...mapped);
     } catch (e) {
-      console.warn("FSA fetch/parse error", e);
+      dbg.errors.push("FSA: " + String(e));
     }
 
     // 投信協会（成長）
     try {
       const tUrl = getToushinExcel();
+      dbg.toushinUrl = tUrl;
       const list = await fetchExcelToJson(tUrl);
-      list.forEach(r => {
-        const m = mapRow(r, { growth: true });
-        if (m) combined.push(m);
-      });
+      const mapped = list.map(r => mapRow(r, { growth: true })).filter(Boolean);
+      dbg.toushinCount = mapped.length;
+      combined.push(...mapped);
     } catch (e) {
-      console.warn("Toushin fetch/parse error", e);
+      dbg.errors.push("Toushin: " + String(e));
     }
 
     if (combined.length === 0) {
-      return NextResponse.json({ ok: false, msg: "0 records" }, { status: 500 });
+      return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-    // 300件ずつUPSERT
+    // DBへUPSERT（300件ずつ）
     let inserted = 0;
     for (let i = 0; i < combined.length; i += 300) {
       const chunk = combined.slice(i, i + 300);
@@ -107,8 +114,10 @@ export async function GET() {
       inserted += data?.length || 0;
     }
 
-    return NextResponse.json({ ok: true, inserted, total: combined.length });
+    const res = { ok: true, inserted, total: combined.length, debug: dbg };
+    return NextResponse.json(res);
   } catch (err) {
-    return NextResponse.json({ ok: false, error: String(err) }, { status: 500 });
+    dbg.errors.push(String(err));
+    return NextResponse.json({ ok: false, error: String(err), debug: dbg }, { status: 500 });
   }
 }
