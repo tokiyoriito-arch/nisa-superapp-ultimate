@@ -4,6 +4,21 @@ import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import * as XLSX from "xlsx";
 
+//重複排除ユーティリティ
+function dedupeBy(arr, keyFn) {
+  const seen = new Set();
+  const out = [];
+  for (const r of arr) {
+    const k = keyFn(r);
+    if (!k) continue;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(r);
+  }
+  return out;
+}
+
+
 // ---- 金融庁つみたて：ページから .xlsx を抽出（相対/絶対どちらもOK） ----
 async function getLatestFsaExcel() {
   if (process.env.FSA_TSUMITATE_EXCEL_URL) return process.env.FSA_TSUMITATE_EXCEL_URL;
@@ -148,7 +163,7 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-// ▼ ここから置き換え（DBへUPSERT）
+// ▼ DBへUPSERT（重複除去してからREST UPSERT）
 const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE;
 
@@ -172,52 +187,68 @@ async function restUpsert(rows, onConflictCols) {
   return res.json();
 }
 
-// ISINが無い行には slug を付与
+// ISINが無い行には slug を付与（未付与なら念のため）
 combined = combined.map(r => {
-  if (!r.isin || String(r.isin).trim() === '') {
-    return { ...r, slug: slugify(r.name, r.company) };
-  }
-  return r;
+  const name = String(r.name || '').trim();
+  const company = String(r.company || '').trim();
+  const isin = r.isin ? String(r.isin).trim() : '';
+  const base = { ...r, name, company, isin: isin || null };
+  if (!base.isin && !base.slug) base.slug = slugify(name, company);
+  return base;
 });
 
 let inserted = 0;
 let skippedNoName = 0;
+let droppedDupIsinName = 0;
+let droppedDupSlug = 0;
 
-for (let i = 0; i < combined.length; i += 300) {
-  const chunk = combined.slice(i, i + 300);
+// バッチサイズは小さめ（重複衝突リスク低減）
+const BATCH = 100;
 
-  // name が無い行は捨てる（念のため）
-  const byName = chunk.filter(r => r.name && String(r.name).trim().length > 0);
+for (let i = 0; i < combined.length; i += BATCH) {
+  const chunk = combined.slice(i, i + BATCH);
+
+  // nameが空の行は除外
+  const byName = chunk.filter(r => r.name && r.name.length > 0);
   skippedNoName += (chunk.length - byName.length);
   if (byName.length === 0) continue;
 
-  // ISINあり / なしでバッチ分け
-  const withIsin = byName.filter(r => r.isin && String(r.isin).trim().length > 0);
-  const withoutIsin = byName.filter(r => !r.isin || String(r.isin).trim().length === 0);
+  // ISINあり/なしで分割
+  const withIsin = byName.filter(r => r.isin && r.isin.length > 0);
+  const withoutIsin = byName.filter(r => !r.isin || r.isin.length === 0);
 
-  if (withIsin.length) {
-    const d1 = await restUpsert(withIsin, 'isin,name'); // ← ユニーク制約に対応
+  // ① (isin,name) で重複除去
+  const uniqIsin = dedupeBy(withIsin, r => `${r.isin}::${r.name}`);
+  droppedDupIsinName += (withIsin.length - uniqIsin.length);
+
+  if (uniqIsin.length) {
+    const d1 = await restUpsert(uniqIsin, 'isin,name');
     inserted += Array.isArray(d1) ? d1.length : 0;
   }
-  if (withoutIsin.length) {
-    // slug でUPSERT（ユニーク制約 funds_slug_key に一致）
-    const d2 = await restUpsert(withoutIsin, 'slug');
+
+  // ② slug で重複除去（slug未設定なら安全のため作り直す）
+  const preparedSlug = withoutIsin.map(r => ({ ...r, slug: r.slug || slugify(r.name, r.company) }));
+  const uniqSlug = dedupeBy(preparedSlug, r => r.slug);
+  droppedDupSlug += (preparedSlug.length - uniqSlug.length);
+
+  if (uniqSlug.length) {
+    const d2 = await restUpsert(uniqSlug, 'slug');
     inserted += Array.isArray(d2) ? d2.length : 0;
   }
 }
 
-// レスポンス（あなたの既存形式に合わせてOK）
+// レスポンス
 return NextResponse.json({
   ok: true,
   inserted,
   total: combined.length,
   skippedNoName,
+  droppedDupIsinName,
+  droppedDupSlug,
   debug: dbg
 });
 // ▲ 置き換えここまで
 
-
-// ここまで -DBへUPSERT（300件ずつ）
 
     return NextResponse.json({ ok: true, inserted, total: combined.length, debug: dbg });
   } catch (err) {
