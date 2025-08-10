@@ -138,12 +138,12 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-// DBへUPSERT（300件ずつ）— ISINが空の行はスキップしてREST UPSERT
+// DBへUPSERT（300件ずつ）— ISINあり/なしでon_conflictを切替
 const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
 const SB_KEY = process.env.SUPABASE_SERVICE_ROLE;
 
-async function restUpsertFunds(rows) {
-  const url = `${SB_URL}/rest/v1/funds?on_conflict=isin,name&select=*`;
+async function restUpsert(rows, onConflictCols) {
+  const url = `${SB_URL}/rest/v1/funds?on_conflict=${encodeURIComponent(onConflictCols)}&select=*`;
   const res = await fetch(url, {
     method: 'POST',
     headers: {
@@ -159,31 +159,36 @@ async function restUpsertFunds(rows) {
     const body = await res.text().catch(() => '');
     throw new Error(`REST upsert failed: ${res.status} ${body}`);
   }
-  return res.json();
+  return res.json(); // 返り値は挿入/更新行
 }
 
 let inserted = 0;
-let skippedNoIsin = 0;
+let skippedNoName = 0;
 
 for (let i = 0; i < combined.length; i += 300) {
   const chunk = combined.slice(i, i + 300);
-  // ★ ISINが空/NULLのレコードを除外
-  const valid = chunk.filter(r => r.isin && String(r.isin).trim().length > 0);
-  skippedNoIsin += (chunk.length - valid.length);
-  if (valid.length === 0) continue;
 
-  const data = await restUpsertFunds(valid);
-  inserted += Array.isArray(data) ? data.length : 0;
+  // 名前は必須（無い行は捨てる）
+  const byName = chunk.filter(r => r.name && String(r.name).trim().length > 0);
+  skippedNoName += (chunk.length - byName.length);
+  if (byName.length === 0) continue;
+
+  // ISINあり/なしで分割
+  const withIsin = byName.filter(r => r.isin && String(r.isin).trim().length > 0);
+  const withoutIsin = byName.filter(r => !r.isin || String(r.isin).trim().length === 0);
+
+  if (withIsin.length) {
+    const d1 = await restUpsert(withIsin, 'isin,name');
+    inserted += Array.isArray(d1) ? d1.length : 0;
+  }
+  if (withoutIsin.length) {
+    const d2 = await restUpsert(withoutIsin, 'name,company');
+    inserted += Array.isArray(d2) ? d2.length : 0;
+  }
 }
 
-// （必要ならレスポンスに含める）
-return NextResponse.json({
-  ok: true,
-  inserted,
-  total: combined.length,
-  skippedNoIsin,
-  debug: dbg
-});
+// レスポンスの末尾で inserted などを返す（あなたの既存ロジックに合わせて）
+return NextResponse.json({ ok: true, inserted, total: combined.length, skippedNoName, debug: dbg });
 
 // ここまで -DBへUPSERT（300件ずつ）
 
