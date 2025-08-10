@@ -1,1 +1,0 @@
-import NavBar from '@/components/NavBar';export default function Page(){return (<><NavBar/><main style={{maxWidth:960,margin:'0 auto',padding:16}}><h1>Ultimate</h1><p>最小構成の雛形（完全版は後で差し替え）</p></main></>)}

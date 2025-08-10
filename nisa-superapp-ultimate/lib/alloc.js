@@ -1,1 +1,0 @@
-export const ASSETS=[{key:'jp_eq',label:'国内株式'}]; export const MODELS={balanced:{alloc:{jp_eq:100}}}; export const AGE_TEMPLATES={}; export function normalizeAlloc(x){return x;}

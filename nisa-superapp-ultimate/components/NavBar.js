@@ -1,1 +1,0 @@
-export default function NavBar(){return <header style={{padding:'8px 0',borderBottom:'1px solid #e2e8f0'}}><div style={{maxWidth:960,margin:'0 auto',padding:'0 16px',display:'flex',gap:12}}><a href='/'>NISA Super App</a><a href='/wizard'>診断</a><a href='/portfolio'>私のPF</a><a href='/community'>みんなのPF</a><a href='/planner'>ライフプラン</a></div></header>; }

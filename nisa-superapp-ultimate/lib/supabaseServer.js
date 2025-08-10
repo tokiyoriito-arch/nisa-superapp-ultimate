@@ -1,1 +1,0 @@
-export function supabaseServer(){return {from(){return {select(){return {}}}}}}
