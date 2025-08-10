@@ -138,17 +138,37 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-// DBへUPSERT（300件ずつ）← insert + upsert:true に変更
+// DBへUPSERT（300件ずつ）← Supabase RESTで実行
+const SB_URL = process.env.NEXT_PUBLIC_SUPABASE_URL;
+const SB_KEY = process.env.SUPABASE_SERVICE_ROLE;
+
+async function restUpsertFunds(rows) {
+  const url = `${SB_URL}/rest/v1/funds?on_conflict=isin,name&select=*`;
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: {
+      'content-type': 'application/json',
+      'apikey': SB_KEY,
+      'Authorization': `Bearer ${SB_KEY}`,
+      'Prefer': 'return=representation,resolution=merge-duplicates'
+    },
+    body: JSON.stringify(rows),
+    cache: 'no-store'
+  });
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error(`REST upsert failed: ${res.status} ${body}`);
+  }
+  return res.json(); // 返り値は挿入・更新された行の配列
+}
+
 let inserted = 0;
 for (let i = 0; i < combined.length; i += 300) {
   const chunk = combined.slice(i, i + 300);
-  const { data, error } = await supabase
-    .from("funds")
-    .insert(chunk, { upsert: true, onConflict: "isin,name" })
-    .select();
-  if (error) throw error;
-  inserted += data?.length || 0;
+  const data = await restUpsertFunds(chunk);
+  inserted += Array.isArray(data) ? data.length : 0;
 }
+
 
     return NextResponse.json({ ok: true, inserted, total: combined.length, debug: dbg });
   } catch (err) {
