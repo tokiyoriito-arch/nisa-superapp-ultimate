@@ -1,0 +1,1 @@
+export const metadata={title:'NISA Super App — Ultimate'};export default function RootLayout({children}){return <html lang='ja'><body>{children}</body></html>;}
