@@ -1,0 +1,9 @@
+
+{
+  "version": 2,
+  "functions": { "app/api/**": { "runtime": "nodejs18.x" } },
+  "crons": [
+    { "path": "/api/sync/perf", "schedule": "30 11 * * 1-5" },
+    { "path": "/api/sync/nisa", "schedule": "0 1 1 * *" }
+  ]
+}
