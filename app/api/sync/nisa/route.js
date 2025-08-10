@@ -4,50 +4,86 @@ import { NextResponse } from "next/server";
 import { supabaseServer } from "@/lib/supabaseServer";
 import * as XLSX from "xlsx";
 
-// --- 最新ExcelのURLを自動抽出（金融庁 つみたて） ---
+// ---- 金融庁つみたて：ページから .xlsx を抽出（相対/絶対どちらもOK） ----
 async function getLatestFsaExcel() {
-  // 手動で固定したい場合は Vercel 環境変数で上書き可
   if (process.env.FSA_TSUMITATE_EXCEL_URL) return process.env.FSA_TSUMITATE_EXCEL_URL;
 
-  const res = await fetch("https://www.fsa.go.jp/policy/nisa2/products/", {
+  const base = "https://www.fsa.go.jp/policy/nisa2/products/";
+  const res = await fetch(base, {
     headers: { "user-agent": "Mozilla/5.0 NISA SuperApp" },
-    cache: "no-store"
+    cache: "no-store",
   });
   if (!res.ok) throw new Error("FSA products page fetch failed");
   const html = await res.text();
 
-  // 例: https://www.fsa.go.jp/policy/nisa2/products/20250728/23.xlsx
-  const re = /https:\/\/www\.fsa\.go\.jp\/policy\/nisa2\/products\/\d{8}\/\d+\.xlsx/g;
-  const matches = html.match(re) || [];
+  // href="...xlsx" を全部拾う（相対パス含む）
+  const hrefs = Array.from(html.matchAll(/href=["']([^"']+\.xlsx)["']/gi)).map(m => m[1]);
 
-  // 旧URLの保険（たまに置いてあることがある）
-  const legacy = html.match(/https:\/\/www\.fsa\.go\.jp\/policy\/nisa2\/products\/tsumitate_list\.xlsx/g) || [];
+  // /policy/nisa2/products/ 配下だけに限定
+  const excelUrls = hrefs
+    .map(href => {
+      try {
+        // 相対→絶対へ
+        return new URL(href, base).toString();
+      } catch { return null; }
+    })
+    .filter(u => u && u.includes("/policy/nisa2/products/"));
 
-  const pick = matches[0] || legacy[0];
-  if (!pick) throw new Error("FSA Excel URL not found on page");
-  return pick;
+  if (!excelUrls.length) throw new Error("FSA Excel URL not found on page");
+  // 先頭（ページ上部の最新）を採用
+  return excelUrls[0];
 }
 
-// --- 投信協会（成長投資枠）は固定URL（必要なら環境変数で差し替え） ---
+// ---- 投信協会（成長）：固定URL（必要なら上書き可） ----
 function getToushinExcel() {
   return process.env.TOUSHIN_GROWTH_EXCEL_URL
     || "https://www.toushin.or.jp/files/static/486/unlisted_fund_for_investor.xlsx";
 }
 
-// --- Excel → 行配列 ---
-async function fetchExcelToJson(url) {
-  const res = await fetch(url, { cache: "no-store" });
+// ---- Excel → 行配列：全シート走査＆ヘッダー行の自動検出 ----
+async function fetchExcelAllRows(url) {
+  const res = await fetch(url, { cache: "no-store", headers: { "user-agent": "Mozilla/5.0" } });
   if (!res.ok) throw new Error(`Excel fetch failed: ${url}`);
   const arr = new Uint8Array(await res.arrayBuffer());
   const wb = XLSX.read(arr, { type: "array" });
-  const ws = wb.Sheets[wb.SheetNames[0]];
-  return XLSX.utils.sheet_to_json(ws, { defval: "" });
+
+  const rows = [];
+  for (const name of wb.SheetNames) {
+    const ws = wb.Sheets[name];
+
+    // まずは素直に1行目見出しとして読む
+    let list = XLSX.utils.sheet_to_json(ws, { defval: "" });
+    if (list.length === 0) continue;
+
+    // ISIN/名称っぽいキーがない場合、ヘッダー行を探す
+    const hasKey = (obj) =>
+      Object.keys(obj).some(k => String(k).includes("ISIN") || String(k).includes("ファンド"));
+    if (!hasKey(list[0])) {
+      // 2D配列で生読み
+      const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+      // ヘッダー候補行=「ISIN or ファンド」を含む行
+      const hIdx = raw.findIndex(r =>
+        Array.isArray(r) && r.some(c => String(c).includes("ISIN") || String(c).includes("ファンド"))
+      );
+      if (hIdx >= 0) {
+        // その行をヘッダーにして再変換
+        const range = XLSX.utils.decode_range(ws["!ref"]);
+        const newRef = { s: { r: hIdx, c: range.s.c }, e: range.e };
+        const hRef = XLSX.utils.encode_range(newRef);
+        list = XLSX.utils.sheet_to_json(ws, { range: hRef, defval: "" });
+      }
+    }
+
+    rows.push(...list);
+  }
+  return rows;
 }
 
-// --- 列名ゆらぎに強いマッパー ---
+// ---- 列名ゆらぎに強いマッパー ----
 function mapRow(row, flags = {}) {
+  const keys = Object.keys(row);
   const find = (cands) =>
-    cands.map(k => Object.keys(row).find(h => h && String(h).includes(k))).find(Boolean);
+    cands.map(k => keys.find(h => h && String(h).includes(k))).find(Boolean);
 
   const isin = String(row[find(["ISIN", "ISINコード", "銘柄コード"])] || "").trim();
   const name = String(row[find(["ファンド名", "ファンド名称", "商品名"])] || "").trim();
@@ -61,7 +97,7 @@ function mapRow(row, flags = {}) {
     company: company || null,
     category: category || null,
     nisa_tsumitate: !!flags.tsumitate,
-    nisa_growth: !!flags.growth
+    nisa_growth: !!flags.growth,
   };
 }
 
@@ -74,11 +110,11 @@ export async function GET(req) {
     const supabase = supabaseServer();
     let combined = [];
 
-    // FSA（つみたて）
+    // つみたて（金融庁）
     try {
       const fsaUrl = await getLatestFsaExcel();
       dbg.fsaUrl = fsaUrl;
-      const list = await fetchExcelToJson(fsaUrl);
+      const list = await fetchExcelAllRows(fsaUrl);
       const mapped = list.map(r => mapRow(r, { tsumitate: true })).filter(Boolean);
       dbg.fsaCount = mapped.length;
       combined.push(...mapped);
@@ -86,11 +122,11 @@ export async function GET(req) {
       dbg.errors.push("FSA: " + String(e));
     }
 
-    // 投信協会（成長）
+    // 成長（投信協会）
     try {
       const tUrl = getToushinExcel();
       dbg.toushinUrl = tUrl;
-      const list = await fetchExcelToJson(tUrl);
+      const list = await fetchExcelAllRows(tUrl);
       const mapped = list.map(r => mapRow(r, { growth: true })).filter(Boolean);
       dbg.toushinCount = mapped.length;
       combined.push(...mapped);
@@ -102,20 +138,18 @@ export async function GET(req) {
       return NextResponse.json({ ok: false, msg: "0 records", debug: dbg }, { status: 500 });
     }
 
-    // DBへUPSERT（300件ずつ）
+    // UPSERT（300件ずつ）
     let inserted = 0;
     for (let i = 0; i < combined.length; i += 300) {
-      const chunk = combined.slice(i, i + 300);
       const { data, error } = await supabase
         .from("funds")
-        .upsert(chunk, { onConflict: "isin,name" })
+        .upsert(combined.slice(i, i + 300), { onConflict: "isin,name" })
         .select();
       if (error) throw error;
       inserted += data?.length || 0;
     }
 
-    const res = { ok: true, inserted, total: combined.length, debug: dbg };
-    return NextResponse.json(res);
+    return NextResponse.json({ ok: true, inserted, total: combined.length, debug: dbg });
   } catch (err) {
     dbg.errors.push(String(err));
     return NextResponse.json({ ok: false, error: String(err), debug: dbg }, { status: 500 });
